@@ -1,0 +1,20 @@
+cat <<EOF > .gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.swp
+*.swo
+*.log
+*.pth
+*.ipynb_checkpoints
+*.tar.gz
+venv/
+.streamenv/
+*.ckpt
+*.pt
+*.wav
+*.zip
+*.onnx
+runs/
+demo/output/
+EOF

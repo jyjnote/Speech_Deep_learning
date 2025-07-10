@@ -1,0 +1,2 @@
+cd /home/data3/jjy/StreamSpeech/fairseq/examples/speech_to_speech/asr_bleu/
+python compute_asr_bleu.py --reference_path /home/data3/jjy/StreamSpeech/res/streamspeech.simultaneous.fr-en/simul-s2st/chunk_size=320/instances.log --lang en --audio_dirpath /home/data3/jjy/StreamSpeech/res/streamspeech.simultaneous.fr-en/simul-s2st/chunk_size=320/wavs --reference_format txt --transcripts_path /home/data3/jjy/StreamSpeech/res/streamspeech.simultaneous.fr-en/simul-s2st/chunk_size=320/asr_transcripts.txt

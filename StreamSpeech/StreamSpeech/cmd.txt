@@ -1,0 +1,64 @@
+export CUDA_VISIBLE_DEVICES=0
+
+ROOT=/home/data3/jjy/StreamSpeech
+PRETRAIN_ROOT=$ROOT/pretrain_models
+VOCODER_CKPT=$PRETRAIN_ROOT/unit-based_HiFi-GAN_vocoder/mHuBERT.layer11.km1000.en/g_00500000
+VOCODER_CFG=$PRETRAIN_ROOT/unit-based_HiFi-GAN_vocoder/mHuBERT.layer11.km1000.en/config.json
+
+LANG=fr
+MODEL=$ROOT/streamspeech.simultaneous.${LANG}-en.pt
+OUTPUT_DIR=$ROOT/res/streamspeech.simultaneous.${LANG}-en/simul-s2st
+CHUNK_SIZE=320
+
+PYTHONPATH=$ROOT/fairseq simuleval \
+  --data-bin ${ROOT}/configs/${LANG}-en \
+  --user-dir ${ROOT}/researches/ctc_unity \
+  --agent-dir ${ROOT}/agent \
+  --source ${ROOT}/example/wav_list.txt \
+  --target ${ROOT}/example/target.txt \
+  --model-path $MODEL \
+  --config-yaml ${ROOT}/configs/${LANG}-en/config_gcmvn.yaml \
+  --multitask-config-yaml ${ROOT}/configs/${LANG}-en/config_mtl_asr_st_ctcst.yaml \
+  --agent ${ROOT}/agent/speech_to_speech.streamspeech.agent.py \
+  --vocoder $VOCODER_CKPT \
+  --vocoder-cfg $VOCODER_CFG \
+  --dur-prediction \
+  --output $OUTPUT_DIR/chunk_size=$CHUNK_SIZE \
+  --source-segment-size $CHUNK_SIZE \
+  --quality-metrics ASR_BLEU \
+  --target-speech-lang en \
+  --latency-metrics AL AP DAL StartOffset EndOffset LAAL ATD NumChunks DiscontinuitySum DiscontinuityAve DiscontinuityNum RTF \
+  --device gpu \
+  --computation-aware \
+  --output-asr-translation True
+
+
+//////////////////
+
+export CUDA_VISIBLE_DEVICES=0
+
+# 경로 설정
+ROOT=/home/data3/jjy/StreamSpeech
+LANG=fr
+MODEL=$ROOT/streamspeech.simultaneous.${LANG}-en.pt
+CHUNK_SIZE=320
+OUTPUT_DIR=$ROOT/res/streamspeech.simultaneous.${LANG}-en/simul-s2tt
+
+Simultaneous Speech-to-Text Translation
+# SimulEval 실행
+PYTHONPATH=$ROOT:$ROOT/fairseq simuleval \
+  --data-bin $ROOT/configs/${LANG}-en \
+  --user-dir $ROOT/researches/ctc_unity \
+  --agent-dir $ROOT/agent \
+  --source $ROOT/example/wav_list.txt \
+  --target $ROOT/example/target.txt \
+  --model-path $MODEL \
+  --config-yaml $ROOT/configs/${LANG}-en/config_gcmvn.yaml \
+  --multitask-config-yaml $ROOT/configs/${LANG}-en/config_mtl_asr_st_ctcst.yaml \
+  --agent $ROOT/agent/speech_to_text.s2tt.streamspeech.agent.py \
+  --output $OUTPUT_DIR/chunk_size=$CHUNK_SIZE \
+  --source-segment-size $CHUNK_SIZE \
+  --quality-metrics BLEU \
+  --latency-metrics AL AP DAL StartOffset EndOffset LAAL ATD NumChunks RTF \
+  --device gpu \
+  --computation-aware
