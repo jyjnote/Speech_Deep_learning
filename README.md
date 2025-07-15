@@ -4,11 +4,11 @@
 
 ## 📚 목차
 
-- [🏗️ LLM 등장 이전 TTS의 원리 (FastSpeech2 기반)](#️-llm-등장-이전-tts의-원리-fastspeech2-기반)
-- [🧠 LLM 기반 TTS의 작동 원리 (Semantic Token, Duration 포함)](#️-llm-기반-tts의-작동-원리-semantic-token-duration-포함-상세-설명)
+- [🏗️ LLM 등장 이전 TTS의 원리 (FastSpeech2 기반)](#llm-before)
+- [🧠 LLM 기반 TTS의 작동 원리 (Semantic Token, Duration 포함)](#llm-after)
 
 
-# 🏗️ LLM 등장 이전 TTS의 원리 (FastSpeech2 기반 예시 포함)
+<h2 id="llm-before">🏗️ LLM 등장 이전 TTS의 원리 (FastSpeech2 기반 예시 포함)</h2>
 
 ---
 
@@ -162,7 +162,7 @@ waveform = vocoder(mel)  # torch.Size([56000]) for 3.5초 at 16kHz
 | Acoustic Model | Mel 예측 | Transformer |
 | Vocoder | Mel → Waveform | HiFi-GAN, WaveGlow, WaveNet |
 
-# 🧠 LLM 기반 TTS의 작동 원리 (Semantic Token, Duration 포함 상세 설명)
+ <h2 id="llm-after">🧠 LLM 기반 TTS의 작동 원리 (Semantic Token, Duration 포함 상세 설명)</h2>
 
 ---
 
