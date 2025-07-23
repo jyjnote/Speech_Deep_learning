@@ -111,6 +111,10 @@ python tools/prepare_ljspeech.py \
 > - `data/ljspeech/utt2spk`
 > - `data/ljspeech/spk2utt`
 
+실행 후 생성 확인
+```bash
+ls data/ljspeech/
+```
 ---
 
 ### ✅ Step 2: Speaker Embedding 추출
@@ -124,6 +128,7 @@ python tools/extract_embedding.py \
 
 > 생성되는 파일:
 > - `utt2embedding.pt`, `spk2embedding.pt`
+
 실행 후 생성 확인
 ```bash
 ls data/ljspeech/
