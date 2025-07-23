@@ -53,7 +53,52 @@ CosyVoice2/
 ## 🔧 Step-by-step 명령어
 
 ### ✅ Step 1: utt2spk, text, wav.scp 생성
+```python
+#!/usr/bin/env python3
+import os
+import argparse
+from glob import glob
 
+def prepare_ljspeech(src_dir, des_dir):
+    os.makedirs(des_dir, exist_ok=True)
+    wav_dir = os.path.join(src_dir, "wavs")
+    metadata_path = os.path.join(src_dir, "metadata.csv")
+
+    with open(metadata_path, 'r', encoding='utf-8') as f_meta, \
+         open(os.path.join(des_dir, "wav.scp"), 'w', encoding='utf-8') as f_wav, \
+         open(os.path.join(des_dir, "text"), 'w', encoding='utf-8') as f_txt, \
+         open(os.path.join(des_dir, "utt2spk"), 'w', encoding='utf-8') as f_u2s, \
+         open(os.path.join(des_dir, "spk2utt"), 'w', encoding='utf-8') as f_s2u:
+
+        spk2utt = {}
+        for line in f_meta:
+            parts = line.strip().split("|")
+            if len(parts) < 2:
+                continue
+            utt_id = parts[0]
+            text = parts[1]
+            wav_path = os.path.abspath(os.path.join(wav_dir, utt_id + ".wav"))
+            spk_id = "ljs"  # LJSpeech has only one speaker
+
+            f_wav.write(f"{utt_id} {wav_path}\n")
+            f_txt.write(f"{utt_id} {text}\n")
+            f_u2s.write(f"{utt_id} {spk_id}\n")
+
+            if spk_id not in spk2utt:
+                spk2utt[spk_id] = []
+            spk2utt[spk_id].append(utt_id)
+
+        for spk_id, utt_list in spk2utt.items():
+            f_s2u.write(f"{spk_id} {' '.join(utt_list)}\n")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--src_dir", type=str, required=True)
+    parser.add_argument("--des_dir", type=str, required=True)
+    args = parser.parse_args()
+    prepare_ljspeech(args.src_dir, args.des_dir)
+
+```
 ```bash
 python tools/prepare_ljspeech.py \
   --src_dir /mnt/jjy/CosyVoice2/LJSpeech \
@@ -79,7 +124,10 @@ python tools/extract_embedding.py \
 
 > 생성되는 파일:
 > - `utt2embedding.pt`, `spk2embedding.pt`
-
+실행 후 생성 확인
+```bash
+ls data/ljspeech/
+```
 ---
 
 ### ✅ Step 3: Speech Token 추출
@@ -93,6 +141,11 @@ CUDA_VISIBLE_DEVICES=7 python tools/extract_speech_token.py \
 
 > 생성되는 파일:
 > - `utt2speech_token.pt`
+
+실행 후 생성 확인
+```bash
+ls -lh data/ljspeech/utt2speech_token.pt
+```
 
 ---
 
@@ -112,6 +165,10 @@ python tools/make_parquet_list.py \
 > - `parquet_000000000.tar`, ...
 > - `data.list`, `utt2data.list`, `spk2data.list`
 
+실행 후 생성 확인
+```bash
+ls data/ljspeech/parquet/
+```
 ---
 
 ### ✅ Step 5: 학습 리스트 복사
@@ -124,7 +181,8 @@ cp data/ljspeech/parquet/data.list data/dev.data.list
 ---
 
 ### ✅ Step 6: LLM 학습 시작 (GPU 7번)
-
+✅ configs/train_ljspeech.yaml이 없다면 conf/cosyvoice2.yaml을 복사해서 아래처럼 수정
+✅ import 파이썬 환경 변수 설정 확인
 ```bash
 export PYTHONPATH=$(pwd):$(pwd)/third_party/Matcha-TTS
 
