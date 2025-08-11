@@ -1,5 +1,3 @@
-# /mnt/raid0/jjy/CosyVoice/streaming/realtime_webui.py
-
 import os
 import sys
 import argparse
@@ -9,96 +7,136 @@ import torch
 import random
 import time
 
-# ✅ Matcha-TTS 경로 명확하게 추가
+# Matcha-TTS 경로 추가
 sys.path.append("/mnt/raid0/jjy/CosyVoice/third_party/Matcha-TTS")
 
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import load_wav, logging
 from cosyvoice.utils.common import set_all_random_seed
 
-# -------------------------
-# Global setup
-# -------------------------
+# 제로샷 프롬프트 음성 설정
 prompt_sr = 16000
 prompt_path = "/mnt/raid0/jjy/CosyVoice/asset/zero_shot_prompt.wav"
 cosyvoice = None
 
-# -------------------------
-# Streaming TTS Handler
-# -------------------------
-def stream_input_handler(current_text, seed):
+
+def generate_tts(current_text, seed):
+    current_text = current_text.strip("\n")
+    debug_log = ""
+
+    # 입력 검증
     if not current_text.strip():
-        logging.debug("[stream_input_handler] Empty input received.")
-        return None
+        msg = "[generate_tts] 입력이 비어있습니다."
+        logging.debug(msg)
+        return None, msg
 
-    last_word = current_text.strip().split()[-1]  # or use full string
-    logging.info(f"[stream_input_handler] Processing word: '{last_word}' with seed {seed}")
+    if not current_text.endswith(" "):
+        msg = "[generate_tts] 마지막이 공백이 아닙니다. 실행하지 않음."
+        logging.info(msg)
+        return None, msg
 
-    prompt_speech_16k = load_wav(prompt_path, target_sr=prompt_sr)  # 🔧 필수 인자 target_sr 추가
-    logging.debug(f"[stream_input_handler] Loaded prompt speech from {prompt_path} at {prompt_sr}Hz")
+    # 마지막 단어만 추출
+    words = current_text.strip().split()
+    if not words:
+        msg = "[generate_tts] 유효한 단어 없음."
+        logging.warning(msg)
+        return None, msg
 
+    last_word = words[-1]
+    debug_log += f"[generate_tts] Synthesizing last word only: '{last_word}' (seed={seed})\n"
+
+    prompt_speech_16k = load_wav(prompt_path, target_sr=prompt_sr)
     set_all_random_seed(seed)
 
-    chunk_idx = 0
-    start_time = time.time()
+    try:
+        # CosyVoice2 inference
+        output_gen = cosyvoice.inference_cross_lingual(
+            tts_text=last_word,
+            prompt_speech_16k=prompt_speech_16k,
+            zero_shot_spk_id="",
+            stream=True
+        )
+        output = next(output_gen)
 
-    for output in cosyvoice.inference_zero_shot(
-        tts_text=last_word,
-        prompt_text=last_word,
-        prompt_speech_16k=prompt_speech_16k,
-        stream=True
-    ):
         sr = cosyvoice.sample_rate
-        chunk_len = output['tts_speech'].shape[1] / sr
-        chunk_rtf = (time.time() - start_time) / chunk_len
-        logging.info(f"[stream_input_handler] 🔊 Chunk {chunk_idx}: {chunk_len:.2f}s, RTF={chunk_rtf:.3f}")
-        chunk_idx += 1
-        start_time = time.time()
-        yield (sr, output['tts_speech'].numpy().flatten())
+        audio = output["tts_speech"].numpy().flatten()
 
-# -------------------------
-# Launch UI
-# -------------------------
+        tts_tokens = output.get("tts_tokens", None)
+        mel = output.get("mel", None)
+        token_len = len(tts_tokens) if tts_tokens is not None else -1
+        mel_len = mel.shape[-1] if mel is not None else -1
+
+        debug_log += f"샘플레이트: {sr}Hz\n"
+        debug_log += f"전체 파형 길이: {len(audio)} samples ({len(audio)/sr:.2f}s)\n"
+        debug_log += f"텐서 shape: {output['tts_speech'].shape}\n"
+        debug_log += f"토큰 길이: {token_len} | Mel 길이: {mel_len}\n"
+        debug_log += "보조 문장 없이 전체 음성 사용\n"
+        debug_log += "음성 생성 완료."
+
+        logging.info(debug_log.strip())
+        return (sr, audio), debug_log
+
+    except Exception as e:
+        debug_log += f"에러 발생: {str(e)}"
+        logging.error(debug_log.strip())
+        return None, debug_log
+
+
 def launch_demo():
-    logging.info("[launch_demo] Starting CosyVoice2 Streaming Gradio UI")
+    logging.info("[launch_demo] Starting CosyVoice2 Gradio UI")
+
     with gr.Blocks() as demo:
-        gr.Markdown("## 💬 CosyVoice2 Real-Time Typing TTS Demo")
+        gr.Markdown("## CosyVoice2: Type-and-speak by word (space-delimited)")
+        gr.Markdown("단어 입력 후 스페이스를 누르면 해당 단어만 음성으로 합성됩니다.")
 
         with gr.Row():
             textbox = gr.Textbox(
-                label="💡 Type and hear speech immediately",
+                label="Type here...",
                 lines=1,
-                placeholder="Start typing to speak...",
+                placeholder="Type words and press space after each",
                 interactive=True
             )
-            seed = gr.Number(value=random.randint(1, 999999), label="Seed", precision=0)
+            seed = gr.Number(
+                value=random.randint(1, 999999),
+                label="Seed",
+                precision=0
+            )
 
-        audio_output = gr.Audio(
-            label="🔊 Generated Audio",
-            autoplay=True,
-            streaming=True,
-            type="numpy",
-            format="wav"
+        with gr.Row():
+            audio_output = gr.Audio(
+                label="Synthesized Audio (only last word)",
+                autoplay=True,
+                streaming=True,
+                type="numpy",
+                format="wav"
+            )
+
+        debug_output = gr.Textbox(
+            label="Debug Log",
+            lines=10,
+            max_lines=20,
+            interactive=False
         )
 
-        textbox.input(
-            fn=stream_input_handler,
+        # 직접적으로 debounce 로직 없이 기본 함수만 연결
+        textbox.change(
+            fn=generate_tts,
             inputs=[textbox, seed],
-            outputs=[audio_output],
-            trigger_mode="always_last",
-            show_progress="minimal",
-            queue=True
+            outputs=[audio_output, debug_output]
         )
 
-    demo.queue()
+    # Gradio queue 설정 적용: concurrency 제한
+    demo.queue(max_size=10, default_concurrency_limit=1)
     demo.launch(server_name="0.0.0.0", server_port=args.port)
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--port', type=int, default=50000)
-    parser.add_argument('--model_dir', type=str, default='pretrained_models/CosyVoice2-0.5B')
+    parser.add_argument('--port', type=int, default=50000, help="Gradio UI 포트 번호")
+    parser.add_argument('--model_dir', type=str, default='pretrained_models/CosyVoice2-0.5B', help="CosyVoice2 모델 경로")
     args = parser.parse_args()
 
+    # 모델 로딩
     logging.info(f"[main] Loading CosyVoice2 model from {args.model_dir}")
     cosyvoice = CosyVoice2(
         model_dir=args.model_dir,
@@ -108,4 +146,5 @@ if __name__ == '__main__':
     )
     logging.info("[main] CosyVoice2 model loaded successfully")
 
+    # UI 실행
     launch_demo()
