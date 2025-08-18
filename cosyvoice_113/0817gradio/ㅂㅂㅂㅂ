@@ -1,0 +1,412 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import argparse
+import threading
+import queue
+import time
+import numpy as np
+import torch
+import gradio as gr
+
+# 프로젝트 루트 기준으로 third_party/Matcha-TTS 등이 필요한 경우 경로 추가
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.join(ROOT_DIR, "third_party/Matcha-TTS"))
+
+from cosyvoice.cli.cosyvoice import CosyVoice2
+from cosyvoice.utils.file_utils import load_wav, logging
+
+# -------------------------
+# 기본 경로 (CLI로 덮어쓸 수 있음)
+# -------------------------
+DEFAULT_MODEL_DIR = "/mnt/raid0/jjy/CosyVoice/pretrained_models/CosyVoice2-0.5B"
+DEFAULT_PROMPT_WAV = "/mnt/raid0/jjy/CosyVoice/asset/zero_shot_prompt.wav"
+DEFAULT_PROMPT_TEXT = "This is a reference voice for zero-shot cloning."
+
+# 전역 상태
+cosy = None
+prompt_speech_16k = None
+MODEL_DIR_SELECTED = DEFAULT_MODEL_DIR
+PROMPT_WAV_SELECTED = DEFAULT_PROMPT_WAV
+
+# 세션별 상태 (텍스트 입력 큐, 종료 이벤트)
+_sessions = {}
+# 입력 코얼레싱/중복 방지용 캐시 (UI 레벨)
+_last_sent_text = {}
+
+# ---------- 유틸 ----------
+
+def _preview(s: str, n: int = 40) -> str:
+    if s is None:
+        return ""
+    s = s.replace("\n", " ")
+    return (s[:n] + "...") if len(s) > n else s
+
+def _common_prefix_len(a: str, b: str) -> int:
+    m = min(len(a), len(b))
+    i = 0
+    while i < m and a[i] == b[i]:
+        i += 1
+    return i
+
+def _safe_qsize(q: queue.Queue) -> int:
+    try:
+        return q.qsize()
+    except Exception:
+        return -1
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+# ---------- 세션 ----------
+
+def _new_session():
+    """텍스트 입력을 전달할 큐와 종료 이벤트 생성 + 진단용 통계 초기화."""
+    text_q = queue.Queue()
+    stop_event = threading.Event()
+    stop_event.clear()
+    stats = {
+        "created_ms": _now_ms(),
+        "ui_input_calls": 0,
+        "ui_ignored_duplicates": 0,
+        "ui_coalesce_drops": 0,
+        "ui_enqueued": 0,
+        "gen_received": 0,
+        "gen_coalesce_drops": 0,
+        "gen_yielded": 0,
+        "stops": 0,
+    }
+    return {
+        "q": text_q,
+        "stop": stop_event,
+        "stats": stats,
+        "last_yielded_text": "",   # 제너레이터가 마지막으로 yield한 스냅샷
+    }
+
+# ---------- 입력 스트림 생성기 ----------
+
+def _text_stream_generator(sess):
+    """
+    UI(.input)로 들어오는 텍스트 '최신 스냅샷'만 모델로 전달.
+    - 큐를 비워 코얼레싱(가장 최신값 하나만 유지)
+    - 상세 로그: 수신/드랍/최종 yield, 길이/프리뷰/증분 추정
+    """
+    q = sess["q"]
+    stop_event = sess["stop"]
+    stats = sess["stats"]
+
+    logging.debug("[gen] start text stream | qsize=%d", _safe_qsize(q))
+
+    while not stop_event.is_set():
+        try:
+            item = q.get(timeout=4)
+        except queue.Empty:
+            continue
+
+        if item is None:  # 종료 신호
+            logging.info("[gen] stop signal received (None).")
+            break
+
+        stats["gen_received"] += 1
+
+        # 코얼레싱: 큐를 비워서 '가장 최신 스냅샷'만 남김
+        coalesce_drop = 0
+        latest = item
+        while True:
+            try:
+                nxt = q.get_nowait()
+                if nxt is None:
+                    latest = None
+                    break
+                latest = nxt
+                coalesce_drop += 1
+            except queue.Empty:
+                break
+
+        stats["gen_coalesce_drops"] += coalesce_drop
+
+        if latest is None:
+            logging.info("[gen] None encountered during coalesce; stopping.")
+            break
+
+        # 진단: latest(스냅샷) 기준으로 제너레이터 레벨 증분 추정
+        last_y = sess["last_yielded_text"]
+        cpl = _common_prefix_len(last_y, latest)
+        appended_len = max(0, len(latest) - cpl)
+        deleted_len = max(0, len(last_y) - cpl)
+        delta_text = latest[cpl:]
+        # 스냅샷을 그대로 보내는 현재 구조에서, to_token_chunks가 '추가분만'을 기대한다면 버그가 발생함
+        if len(last_y) > 0 and cpl < len(last_y):
+            # 이전에 모델에 보낸 스냅샷의 접두사가 깨졌거나, 재조립/중복 가능성
+            logging.warning(
+                "[gen] SNAPSHOT PREFIX SHRANK (possible manual delete or mismatch). "
+                "prev_yield_len=%d, now_len=%d, common_prefix=%d, deleted=%d, appended=%d, "
+                "now_tail='%s'",
+                len(last_y), len(latest), cpl, deleted_len, appended_len, _preview(delta_text, 30)
+            )
+        else:
+            logging.debug(
+                "[gen] yield snapshot | len=%d (Δ+%d, Δ-%d, prefix=%d, coalesce_drop=%d) | qsize=%d | text='%s'",
+                len(latest), appended_len, deleted_len, cpl, coalesce_drop, _safe_qsize(q), _preview(latest)
+            )
+
+        sess["last_yielded_text"] = latest
+        stats["gen_yielded"] += 1
+        yield latest
+
+    logging.debug(
+        "[gen] exit | recv=%d, coalesce_drops=%d, yielded=%d, stops=%d",
+        stats["gen_received"], stats["gen_coalesce_drops"], stats["gen_yielded"], stats["stops"]
+    )
+
+# ---------- 스트림 시작 ----------
+
+def start_stream(session_id: str,
+                 chunk_tokens=None,
+                 interleave_prompt=False,
+                 speed=1.0,
+                 text_frontend=True):
+    """
+    스트리밍 합성 시작. Audio 컴포넌트로 (sr, wave) 스트림을 지속적으로 yield.
+    (UI에서 고급 옵션을 제거했지만, 내부 기본값 인자를 유지)
+    """
+    global cosy, prompt_speech_16k
+
+    if session_id not in _sessions:
+        _sessions[session_id] = _new_session()
+        logging.info("[start] new session created sid=%s", session_id)
+    sess = _sessions[session_id]
+    stats = sess["stats"]
+
+    logging.info(
+        "[start] sid=%s | chunk_tokens=%s interleave=%s speed=%.3f text_frontend=%s",
+        session_id, str(chunk_tokens), interleave_prompt, float(speed), bool(text_frontend)
+    )
+
+    try:
+        # CosyVoice2의 bi-stream 타이핑 합성 제너레이터 구성
+        gen = cosy.inference_zero_shot_typing(
+            text_stream=_text_stream_generator(sess),   # 최신 스냅샷만 전달
+            prompt_text=DEFAULT_PROMPT_TEXT,
+            prompt_speech_16k=prompt_speech_16k,
+            zero_shot_spk_id="",
+            stream=True,
+            speed=float(speed),
+            text_frontend=bool(text_frontend),
+            chunk_tokens=int(chunk_tokens) if chunk_tokens and int(chunk_tokens) > 0 else None,
+            interleave_prompt_in_llm=bool(interleave_prompt),
+        )
+
+        forwarded = 0
+        for out in gen:
+            wav = out["tts_speech"].squeeze(0).cpu().numpy()  # (N,)
+            sr = cosy.sample_rate
+            forwarded += 1
+            logging.debug(
+                "[start] forward audio chunk#%d | samples=%d, secs=%.3f, sr=%d",
+                forwarded, wav.shape[0], wav.shape[0] / float(sr), sr
+            )
+            yield (sr, wav)
+
+        logging.info("[start] generator exhausted | audio_chunks_forwarded=%d", forwarded)
+
+    except Exception as e:
+        logging.exception("[start] streaming error: %s", e)
+    finally:
+        # 끝 처리 (세션 유지, stop은 따로)
+        logging.debug(
+            "[start] finalize sid=%s | stats=%s | qsize=%d",
+            session_id, stats, _safe_qsize(sess["q"])
+        )
+
+# ---------- 텍스트 입력 핸들러 ----------
+
+def on_text_input(session_id, current_text):
+    """
+    텍스트박스 .input 이벤트 핸들러.
+    - 같은 내용 반복 전송은 무시
+    - 큐를 비우고(코얼레싱) 최신 스냅샷 1건만 넣어 폭주 방지
+    - 상세 로그: 입력 길이/증분 추정/드랍/큐 상태
+    """
+    if session_id not in _sessions:
+        _sessions[session_id] = _new_session()
+        logging.info("[ui.input] new session created sid=%s", session_id)
+    sess = _sessions[session_id]
+    stats = sess["stats"]
+
+    txt = current_text or ""
+    prev = _last_sent_text.get(session_id, "")
+
+    stats["ui_input_calls"] += 1
+
+    # 증분 추정 (UI 레벨 스냅샷 기준)
+    cpl = _common_prefix_len(prev, txt)
+    appended_len = max(0, len(txt) - cpl)
+    deleted_len  = max(0, len(prev) - cpl)
+    delta_text = txt[cpl:]
+
+    # 같은 내용이면 무시
+    if prev == txt:
+        stats["ui_ignored_duplicates"] += 1
+        logging.debug(
+            "[ui.input] sid=%s IGNORE duplicate | len=%d | calls=%d dup_ign=%d | text='%s'",
+            session_id, len(txt), stats["ui_input_calls"], stats["ui_ignored_duplicates"], _preview(txt)
+        )
+        return
+
+    _last_sent_text[session_id] = txt
+
+    # 큐 비우기(코얼레싱). 중간에 stop 센티널(None)을 만나면 복원
+    coalesce_drop = 0
+    try:
+        while True:
+            v = sess["q"].get_nowait()
+            coalesce_drop += 1
+            if v is None:
+                sess["q"].put(None)
+                break
+    except queue.Empty:
+        pass
+    if coalesce_drop > 0:
+        stats["ui_coalesce_drops"] += (coalesce_drop - 1 if coalesce_drop > 0 else 0)
+
+    # 진단 로그: 스냅샷 전달 경고 (모델 쪽에서 '증분'을 기대한다면 중복 누적 원인)
+    if len(prev) > 0 and appended_len < len(txt):
+        # prev 전체를 포함하는 스냅샷(=전체 텍스트)을 매번 보냄 → to_token_chunks에서 buffer_text += snapshot 시 중복 누적
+        logging.warning(
+            "[ui.input] sid=%s SENDING SNAPSHOT (not delta). prev_len=%d now_len=%d prefix=%d Δ+%d Δ-%d | "
+            "now_tail='%s' | (If TTS expects deltas, this can cause repeated text.)",
+            session_id, len(prev), len(txt), cpl, appended_len, deleted_len, _preview(delta_text, 30)
+        )
+    else:
+        logging.debug(
+            "[ui.input] sid=%s enqueue snapshot | now_len=%d (Δ+%d, Δ-%d, prefix=%d) "
+            "coalesce_drop=%d qsize_before=%d | text='%s'",
+            session_id, len(txt), appended_len, deleted_len, cpl, coalesce_drop, _safe_qsize(sess["q"]), _preview(txt)
+        )
+
+    # 최신 스냅샷 1건만 넣기
+    try:
+        sess["q"].put(txt, block=False)
+    except Exception:
+        sess["q"].put(txt)  # fallback (blocking)
+    stats["ui_enqueued"] += 1
+
+    logging.debug(
+        "[ui.input] sid=%s enqueued | qsize_after=%d | enq_total=%d",
+        session_id, _safe_qsize(sess["q"]), stats["ui_enqueued"]
+    )
+
+# ---------- 정지 ----------
+
+def stop_stream(session_id):
+    """스트리밍 종료: 제너레이터에 종료 신호(None) 전달."""
+    if session_id in _sessions:
+        _sessions[session_id]["stop"].set()
+        try:
+            _sessions[session_id]["q"].put_nowait(None)
+        except Exception:
+            _sessions[session_id]["q"].put(None)
+        _sessions[session_id]["stats"]["stops"] += 1
+        logging.info(
+            "[stop] sid=%s stop signaled | stats=%s | qsize=%d",
+            session_id, _sessions[session_id]["stats"], _safe_qsize(_sessions[session_id]["q"])
+        )
+    return None  # Audio 초기화(정지)
+
+def clear_textbox():
+    return ""
+
+# ---------- UI ----------
+
+def build_demo():
+    with gr.Blocks(title="CosyVoice2 Typing-Stream TTS", css="""
+    #audio {min-height: 80px;}
+    """) as demo:
+        gr.Markdown("## CosyVoice2 실시간 타이핑 TTS (n:m bi-stream)")
+        gr.Markdown("모델과 프롬프트는 **서버 시작 시 선 로드됨**. 아래 경로는 정보 표시용입니다.")
+
+        with gr.Row():
+            model_dir_info = gr.Textbox(
+                label="Model Dir (preloaded)",
+                value=MODEL_DIR_SELECTED,
+                interactive=False
+            )
+            prompt_wav_info = gr.Textbox(
+                label="Prompt WAV (preloaded, 16kHz)",
+                value=PROMPT_WAV_SELECTED,
+                interactive=False
+            )
+
+        with gr.Row():
+            text = gr.Textbox(
+                label="Type here (실시간 입력)",
+                lines=4,
+                placeholder="타이핑하면 바로바로 합성이 시작됩니다. (영문 권장)"
+            )
+
+        audio = gr.Audio(label="Streaming Audio", streaming=True, autoplay=True, elem_id="audio")
+        with gr.Row():
+            start_btn = gr.Button(" Start", variant="primary")
+            stop_btn = gr.Button(" Stop", variant="stop")
+            clear_btn = gr.Button(" Clear Text")
+
+        # 세션 식별용 (간단히 timestamp 기반)
+        session_id = gr.State(value=str(time.time()))
+
+        # Start
+        def _start(sid):
+            logging.info("[ui.start] clicked | sid=%s", sid)
+            # 한글에서 과도한 2-토큰 청크 폭주 방지용: n=8 권장
+            yield from start_stream(sid, 8, False, 1.0, True)
+
+        start_btn.click(
+            _start,
+            inputs=[session_id],
+            outputs=[audio],
+            queue=True
+        )
+
+        # Stop
+        stop_btn.click(stop_stream, inputs=[session_id], outputs=[audio])
+
+        # Text 변화 -> 입력 큐에 현재 버퍼 전달 (디바운스 0으로 키 입력마다)
+        text.input(on_text_input, inputs=[session_id, text], outputs=[])
+
+        # Clear text
+        clear_btn.click(clear_textbox, inputs=[], outputs=[text])
+
+    return demo
+
+# ---------- main ----------
+
+def main():
+    global cosy, prompt_speech_16k, MODEL_DIR_SELECTED, PROMPT_WAV_SELECTED
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--server-name", type=str, default="0.0.0.0")
+    parser.add_argument("--model-dir", type=str, default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--prompt-wav", type=str, default=DEFAULT_PROMPT_WAV)
+    args = parser.parse_args()
+
+    # 1) 모델/프롬프트 **선 로드**
+    MODEL_DIR_SELECTED = args.model_dir
+    PROMPT_WAV_SELECTED = args.prompt_wav
+
+    logging.info("[init] loading model from: %s", MODEL_DIR_SELECTED)
+    cosy = CosyVoice2(MODEL_DIR_SELECTED, fp16=torch.cuda.is_available())
+
+    logging.info("[init] loading prompt wav: %s", PROMPT_WAV_SELECTED)
+    prompt_speech_16k = load_wav(PROMPT_WAV_SELECTED, 16000)
+
+    # 2) 웹 UI 실행 (선 로드 완료 후)
+    demo = build_demo()
+    demo.queue(max_size=8, default_concurrency_limit=2)
+    logging.info("[init] launching gradio | host=%s port=%d", args.server_name, args.port)
+    demo.launch(server_name=args.server_name, server_port=args.port, share=False)
+
+if __name__ == "__main__":
+    main()
