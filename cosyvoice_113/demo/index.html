@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CosyVoice 실시간 오디오 스트리밍</title>
+</head>
+<body>
+    <h1>CosyVoice 실시간 스트리밍</h1>
+    <p id="status">서버에 연결 중...</p>
+
+    <h3>실시간 오디오</h3>
+    <audio id="audioPlayer" controls></audio>
+
+    <h3>최종 합본 오디오</h3>
+    <audio id="finalAudio" controls></audio><br>
+    <a id="finalDownload" href="#" download="final_audio.wav">Download Final Audio</a>
+
+    <script>
+        const statusElement = document.getElementById('status');
+        const audioPlayer = document.getElementById('audioPlayer');
+        const finalAudio = document.getElementById('finalAudio');
+        const finalDownload = document.getElementById('finalDownload');
+
+        const audioQueue = [];
+        let isPlaying = false;
+
+        const eventSource = new EventSource("/audio_events");
+        statusElement.textContent = '오디오 스트림 대기 중...';
+
+        eventSource.onmessage = function(event) {
+            if (event.data.startsWith("END_OF_STREAM")) {
+                statusElement.textContent = '스트리밍 완료. 최종본 준비됨.';
+                finalAudio.src = "/final_audio";
+                finalDownload.href = "/final_audio";
+                eventSource.close();
+                return;
+            }
+
+            const audioDataUrl = "data:audio/wav;base64," + event.data;
+            audioQueue.push(audioDataUrl);
+            statusElement.textContent = `오디오 청크 ${audioQueue.length}개 수신 완료.`;
+            if (!isPlaying) {
+                playNextInQueue();
+            }
+        };
+
+        function playNextInQueue() {
+            if (audioQueue.length > 0) {
+                isPlaying = true;
+                audioPlayer.src = audioQueue.shift();
+                audioPlayer.play().catch(e => {
+                    statusElement.textContent = "브라우저 자동재생 차단됨. 페이지 클릭 필요.";
+                    isPlaying = false;
+                });
+            } else {
+                isPlaying = false;
+            }
+        }
+
+        audioPlayer.onended = function() {
+            playNextInQueue();
+        };
+
+        document.body.addEventListener('click', () => {
+            if (!isPlaying) {
+                playNextInQueue();
+            }
+        }, true);
+
+        eventSource.onerror = function(err) {
+            statusElement.textContent = '서버 연결 오류!';
+            console.error("EventSource failed:", err);
+            eventSource.close();
+        };
+    </script>
+</body>
+</html>
