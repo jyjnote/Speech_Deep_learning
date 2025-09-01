@@ -354,6 +354,37 @@ class CosyVoice2(CosyVoice):
 
         threading.Thread(target=synthesizer, daemon=True).start()
 
+        # def synthesizer():
+        #     while True:
+        #         s = synth_q.get()
+        #         if s is None:
+        #             out_q.put(None)
+        #             return
+
+        #         try:
+        #             for norm_str, model_input in build_model_input_for_text(s):
+        #                 t0 = time.time()
+        #                 #  수정: text=norm_str → tts_text=norm_str
+        #                 for out in self.inference_zero_shot(
+        #                     tts_text=norm_str,
+        #                     prompt_text=prompt_text,
+        #                     prompt_speech_16k=prompt_speech_16k,
+        #                     zero_shot_spk_id=zero_shot_spk_id,
+        #                     stream=False,
+        #                     speed=speed,
+        #                     text_frontend=text_frontend,
+        #                 ):
+        #                     wav = out["tts_speech"]
+        #                     secs = float(wav.shape[1]) / float(self.sample_rate)
+        #                     logging.info("[즉시합성] '%s' → %.2fs",
+        #                                 norm_str[:40] + ("..." if len(norm_str) > 40 else ""), secs)
+        #                     out_q.put(out)
+        #                 logging.debug("[즉시합성] done | time=%.3fs", time.time() - t0)
+        #         except Exception as e:
+        #             logging.error("[즉시합성] 실패: %s", e, exc_info=True)
+
+        # threading.Thread(target=synthesizer, daemon=True).start()
+            
         # ---------- 2) 최종 제너레이터: out_q 에 쌓이는 오디오를 즉시 Yield ----------
         # 합성 중에도 parser는 계속 입력을 받아 다음 문장을 큐에 넣는다.
         while True:
