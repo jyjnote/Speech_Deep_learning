@@ -192,3 +192,173 @@ class CosyVoice2(CosyVoice):
                 logging.info('yield speech len {}, rtf {}'.format(speech_len, (time.time() - start_time) / speech_len))
                 yield model_output
                 start_time = time.time()
+                
+    def inference_zero_shot_typing(
+            self,
+            text_stream,                  # Generator[str | Tuple["RESET", str] | List[int]]
+            prompt_text: str,
+            prompt_speech_16k,
+            zero_shot_spk_id: str = "",
+            stream: bool = True,          # <- 전달은 받지만 내부에선 즉시합성 위해 비스트리밍으로 실행
+            speed: float = 1.0,
+            text_frontend: bool = True,
+            chunk_tokens: int | None = None,          # 더 이상 사용하지 않음(호환만 유지)
+            interleave_prompt_in_llm: bool = True,   # LLM에 프롬프트 음성토큰 투입 여부
+        ):
+        """
+        [개편] 입력을 받아 문장 단위로 '즉시 합성' 하는 파이프라인.
+        - 구두점(.,!?…。！？)이 들어오면 그 시점까지의 문장을 즉시 비스트리밍 합성(stream=False)
+        - ("RESET", text) 신호가 오면 해당 text 전체를 즉시 합성 큐에 투입 (구두점 없으면 문단 단위로도 합성)
+        - 합성은 백그라운드 스레드에서 진행되어, 합성 중에도 입력 수집/문장 파싱은 계속 진행됨
+        - 보이스 클로닝(Zero-shot) 경로를 사용하며, 프롬프트 기반 임베딩/토큰은 1회만 준비 후 재사용
+        """
+        import re, queue, threading, time, copy, math, torch
+        from cosyvoice.utils.file_utils import logging
+
+        # ---------- 0) 보이스 클로닝용 프롬프트 패키지 1회 준비 ----------
+        # prompt_text는 zero-shot에선 굳이 쓸 필요 없으므로 '<|endofprompt|>' 로 마감 토큰만 부여
+        prompt_pack = self.frontend.frontend_zero_shot(
+            "", "<|endofprompt|>", prompt_speech_16k, self.sample_rate, zero_shot_spk_id
+        )
+
+        for k, v in prompt_pack.items():
+            if torch.is_tensor(v):
+                print(f"[prompt_pack] {k}: shape={tuple(v.shape)} dtype={v.dtype}")
+            else:
+                print(f"[prompt_pack] {k}: {type(v)}")
+
+        device = self.model.device
+
+        # LLM에 프롬프트 음성토큰을 섞지 않도록 선택한 경우, 해당 필드를 0길이 텐서로 마스킹
+        if not interleave_prompt_in_llm:
+            prompt_pack["llm_prompt_speech_token"] = torch.zeros(1, 0, dtype=torch.int32, device=device)
+
+        # 이후 문장마다 바뀌는 것은 'text'와 'text_len' 뿐이므로, 나머지 프롬프트 관련 텐서는 재사용
+        def build_model_input_for_text(sentence: str) -> dict:
+            # 텍스트 정규화(언어별 TN + 문장 길이 제어)
+            normed_list = self.frontend.text_normalize(sentence, split=True, text_frontend=text_frontend)
+            out = []
+            for nc in normed_list:
+                t_tok, t_len = self.frontend._extract_text_token(nc)
+                pack = copy.copy(prompt_pack)
+                pack["text"] = t_tok
+                pack["text_len"] = t_len
+                out.append((nc, pack))
+            return out  # [(정규화문장, model_input_pack), ...] 딕션너리를 다음에 추가해서 합성 준비
+
+        # ---------- 1) 파이프라인용 큐/스레드 준비 ----------
+        in_q     = queue.Queue()  # 외부에서 들어오는 text_stream을 먼저 담는 큐, feeder > parser 로 들어오는 원문 입력(문자/RESET 등) 
+        # feeder 스레드가 이 큐에 데이터를 넣고, parser 스레드가 이 큐에서 꺼내서 문장 단위로 가공
+        synth_q  = queue.Queue()  # parser > synthesizer 로 넘어가는 "완성 문장"
+        # parser 스레드가 in_q에서 데이터를 꺼내 문장 단위로 조립한 후, 완성된 문장저장
+        out_q    = queue.Queue()  # synthesizer > 최종 제너레이터 로 넘어가는 오디오, 오디오 스택
+
+        # 1-1) 입력 feeder: 외부 text_stream을 받아 in_q에 그대로 투입
+        def feeder():
+            for x in text_stream:
+                in_q.put(x)
+            in_q.put(None)  # 종료 신호
+        threading.Thread(target=feeder, daemon=True).start()
+
+        # 1-2) 문장 파서: 구두점 기준으로 문장을 완성시키면 synth_q에 즉시 투입
+        #      ("RESET", text) 가 오면 기존 버퍼를 폐기하고, 전달받은 text 전체를 문장 분할 후 투입
+        # SENT_END = re.compile(r"[.!?…。！？]+")
+        SENT_END = re.compile(r"[.!?,，、…。！？]+")
+        buffer_text = []
+
+        def flush_sentence(s: str):
+            s = s.strip()
+            if not s:
+                return
+            synth_q.put(s)
+            logging.debug("[타이핑] 문장 flush → '%s'", s[:80] + ("..." if len(s) > 80 else ""))
+
+        def split_by_sentence(text: str):
+            # 구두점 포함 분할: "안녕. 반가워요!" → ["안녕.", " 반가워요!"]
+            parts = re.split(r'(?<=[.!?,，、…。！？])', text)
+            # 마지막 조각이 구두점 없이 끝날 수 있어 빈문자 제거
+            merged = []
+            acc = ""
+            for p in parts:
+                acc += p
+                if SENT_END.search(p):
+                    merged.append(acc)
+                    acc = ""
+            if acc:
+                merged.append(acc)
+            return [m for m in merged if m.strip()]
+
+        def parser():
+            nonlocal buffer_text
+            while True:
+                it = in_q.get() # 꺼내서 처리를 시작함
+                if it is None:
+                    # 종료 시, 남은 버퍼를 한 번에 넘김
+                    rest = "".join(buffer_text).strip()
+                    if rest:
+                        for sent in split_by_sentence(rest):
+                            flush_sentence(sent)
+                    synth_q.put(None)
+                    return
+
+                # RESET 신호: 기존 버퍼 폐기 후, 전달 텍스트 전체를 즉시 투입
+                if isinstance(it, tuple) and len(it) == 2 and it[0] == "RESET":
+                    logging.info("[타이핑] RESET 수신 → 기존버퍼 폐기 & 강제 Flush")
+                    buffer_text = []
+                    full_text = str(it[1])
+                    # 문장 단위로 쪼개서 투입 (구두점 없으면 통문장으로 투입)
+                    splitted = split_by_sentence(full_text) or [full_text]
+                    for s in splitted:
+                        flush_sentence(s)
+                    continue
+
+                # 사전 토큰화 입력은 이 경로에선 지원하지 않음(문장 경계 판단이 어렵기 때문)
+                if isinstance(it, (list, tuple)) and all(isinstance(x, int) for x in it):
+                    logging.warning("[타이핑] 사전토큰화 입력은 즉시합성 경로에서는 미지원 → 무시")
+                    continue
+
+                # 일반 문자 입력
+                ch = str(it)
+                buffer_text.append(ch)
+                if SENT_END.search(ch):
+                    # 구두점 등장 → 현재까지 버퍼를 문장 단위로 분리하여 모두 투입
+                    text = "".join(buffer_text)
+                    buffer_text = []
+                    for s in split_by_sentence(text):
+                        flush_sentence(s)
+
+        threading.Thread(target=parser, daemon=True).start()
+
+        # 1-3) 합성기: synth_q에서 문장을 꺼내 즉시 '비스트리밍' 합성으로 오디오를 생성 후 out_q에 넣음
+        def synthesizer():
+            while True:
+                s = synth_q.get()
+                if s is None:
+                    out_q.put(None)
+                    return
+
+                # 정규화된 문장들에 대해 각각 합성(길면 내부에서 여러개로 쪼개진 리스트가 돌아옴)
+                try:
+                    for norm_str, model_input in build_model_input_for_text(s):
+                        # 즉시 합성: stream=False → 토큰 누적 대기 없음
+                        t0 = time.time()
+                        for out in self.model.tts(**model_input, stream=False, speed=speed):
+                            # out 은 {"tts_speech": Tensor[1, T]} 한 번만 옴
+                            wav = out["tts_speech"]
+                            secs = float(wav.shape[1]) / float(self.sample_rate)
+                            logging.info("[즉시합성] '%s' → %.2fs", norm_str[:40] + ("..." if len(norm_str) > 40 else ""), secs)
+                            out_q.put(out)
+                        logging.debug("[즉시합성] done | time=%.3fs", time.time() - t0)
+                except Exception as e:
+                    logging.error("[즉시합성] 실패: %s", e, exc_info=True)
+
+        threading.Thread(target=synthesizer, daemon=True).start()
+
+        # ---------- 2) 최종 제너레이터: out_q 에 쌓이는 오디오를 즉시 Yield ----------
+        # 합성 중에도 parser는 계속 입력을 받아 다음 문장을 큐에 넣는다.
+        while True:
+            o = out_q.get()
+            if o is None:
+                break
+            yield o
+
